@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # author: Marcus Schopen (marcus.schopen@uni-bielefeld.de)
-# version: 0.1.1-5 (06.06.2016)
 
+
+__VERSION="0.1.1-6" # 06.06.2016
 
 # turn on bash traces via command line
 # DEBUG=1 bupmonkey -c CONFIGFILE
@@ -626,7 +627,7 @@ function main() {
   create_bup_log_file \
     || { echo "ERROR: ${CMD_OUTPUT}" >&2; exit 1; };
 
-  bup_logger "bupmonkey starting with PID ${PID}. banana time"
+  bup_logger "bupmonkey ${__VERSION} starting with PID ${PID}. banana time"
 
   # run preexec commands
   bup_preexec \
