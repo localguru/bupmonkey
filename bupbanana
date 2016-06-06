@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # author: Marcus Schopen (marcus.schopen@uni-bielefeld.de)
-# version: 0.1.1-5 (06.06.2016)
 
+
+__VERSION="0.1.1-6" # 06.06.2016
 
 # turn on bash traces via command line
 # DEBUG=1 bupbanana -c CONFIGFILE
@@ -239,6 +240,8 @@ function display_help() {
   [ "$TERM" == "dumb" ] && return 0
     
   cat << EOF
+Version: bupbanana ${__VERSION}
+
 Usage: ${0##*/} [-h] [--preexec|--preexec-with-image|--postexec] [CONFIGFILE]
 
     -h|--help               display this help and exit
@@ -248,7 +251,8 @@ Usage: ${0##*/} [-h] [--preexec|--preexec-with-image|--postexec] [CONFIGFILE]
 
     CONFIGFILE		    the default is /etc/bup/bupbanana.conf
             
-for full debug trace use DEBUG=1 ${0##*/}
+For full debug trace use DEBUG=1 ${0##*/}
+
 EOF
 }
 

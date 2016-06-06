@@ -673,6 +673,8 @@ function main() {
 # usage info
 function display_help() {
 cat << EOF   
+Version: bupmonkey ${__VERSION}
+
 Usage: ${0##*/} [-h] [-c CONFIGFILE]
 
     -h             display this help and exit
