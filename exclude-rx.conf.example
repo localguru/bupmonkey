@@ -1,0 +1,4 @@
+^/vol/backup/backsnap_root/dev/.
+^/vol/backup/backsnap_root/proc/.
+^/vol/backup/backsnap_root/sys/.
+^/vol/backup/backsnap_root/tmp/.

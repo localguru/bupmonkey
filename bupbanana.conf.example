@@ -1,0 +1,45 @@
+#################################################
+# bupbanana.conf - bupbanana configuration file #
+#################################################
+
+# Display output of commands. The default is 1.
+#
+#CMD_DISPLAY="1"
+
+
+# Directory to backup. Default is /vol/backup
+#
+#BACKUP_DIR="/vol/backup"
+
+
+# LVM snapshot name preefix
+#
+LV_SNAP_NAME_PREFIX="backsnap2"
+
+# LVM partitions to snapshot
+#
+LV_LIST="root"
+
+# LVM partition to create a full dump from
+#
+#LV_LIST_IMAGE_DUMP=""
+
+
+# KVM Domains to snapshot.
+#
+DOMAIN_LIST="Test2,Test TestExistiertNicht"
+
+# Lockfile directory. Default is /tmp/.bupbanana
+#
+#LOCK_DIR="/tmp/.bupbanana"
+
+# By default, bupbanana, check if another instance is running
+#
+#STOP_ON_STALE_LOCKFILE="1"
+
+
+# rollback on preexec failures. The default is 1
+#
+#ROLLBACK_PREEXEC="1"
+
+#END OF CONFIG

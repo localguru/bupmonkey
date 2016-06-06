@@ -1,0 +1,84 @@
+#################################################
+# bupmonkey.conf - bupmonkey configuration file #
+#################################################
+
+# Logile. The default is /var/log/bup/bupmonkey.log
+#
+BUP_LOG_FILE="/var/log/bup/kvmtesthost.log"
+
+# Stop if there is a stale lockfile, highly recommended
+# Take care of write permissions if bupmonkey is running under
+# different user IDs. The defaults are 1 and and /tmp/.bup.
+#
+#STOP_ON_STALE_LOCKFILE="1"
+#STALE_LOCK_DIR="/tmp/.bup"
+
+# Display output of all commands. The default is 1.
+#CMD_DISPLAY="1"
+
+# run a bup remote.
+#
+BUP_REMOTE="1"
+
+# remote server user@host:port 
+# only in compination with BUP_REMOTE
+#
+BUP_REMOTE_HOST="root@testvm01.jura.uni-bielefeld.de:1673"
+
+# path to local bup repository
+#
+BUP_REPO_DIR="/vol/backup/test/kvmtesthost/bup/"
+
+# bup branch name
+#
+BUP_REPO_NAME="kvmtesthost"
+
+# paths to backup
+#
+BUP_FILE_NAMES="/vol/backup/"
+
+# preexec commands to execute, see bupbanana
+#
+BUP_SCRIPT_PREEXEC="ssh -p 22022 backup@domain.tld /root/bin/bupbanana --preexec"
+#BUP_SCRIPT_PREEXEC_1=""
+
+
+# postexec commands to execute, see bupbanana
+#
+BUP_SCRIPT_POSTEXEC="ssh -p 22022 backup@domain.tld /root/bin/bupbanana --postexec"
+#BUP_SCRIPT_POSTEXEC_0=""
+#BUP_SCRIPT_POSTEXEC_1=""
+
+
+# Disable log timestamp prefix, helpful for bubbanana remote commands
+# with come with full timestamp output
+#
+DISABLE_LOG_PREFIX_BUP_SCRIPT="BUP_SCRIPT_POSTEXEC BUP_SCRIPT_PREEXEC"
+
+# Rollback preexec on failure
+#
+BUP_ROLLBACK="1"
+
+# Bup options. See bup man pages for options.
+# In case of remote excludes have to be placed on the remote site
+#
+# with modification and status output, which can be massive on initial backup
+#
+BUP_INDEX_OPTIONS="--update --print --modified --status --check --exclude-from=/etc/bup/exclude.conf --exclude-rx-from=/etc/bup/exclude-rx.conf"
+#
+# standard output
+#
+#BUP_INDEX_OPTIONS="--exclude-from=/etc/bup/exclude.conf --exclude-rx-from=/etc/bup/exclude-rx.conf"
+
+# display output of bup index command
+BUP_INDEX_DISPLAY="1"
+
+
+# bup save and fsck options. see bup-save and bup-fsck manpage
+BUP_SAVE_OPTIONS="--strip --commit --tree"
+BUP_FSCK_OPTIONS="--quick"
+
+# bup fsck. The default is 1
+BUP_FSCK="1"
+
+#END OF CONFIG

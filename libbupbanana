@@ -1,0 +1,761 @@
+#!/bin/bash
+
+# bupbananalib
+
+# author: Marcus Schopen (marcus@schopen.de)
+# version: 0.1.1-5 (06.06.2016)
+
+
+# --------------------------------------
+# LOGGING
+# --------------------------------------
+
+# report error and exit
+function error_and_exit() {
+  local message=${1:-}
+
+  printf "%(%a %d %b %Y %T)T %s" -1 >&2  
+  printf "%s\n" "${PROG_NAME}: ERROR: ${message}. Aborting" 1>&2
+  printf "%(%a %d %b %Y %T)T %s" -1 >&2  
+  printf "%s\n" "${PROG_NAME}: CRITCAL: bupbanana finished with errors!" 1>&2
+
+  exit 1;
+}
+
+
+# some logging
+function banana_logger() {
+  local message=${1:-} 
+  local prefix=""
+  local opt_noprefix=${@: -1}
+
+  printf "%(%a %d %b %Y %T)T %s" -1 >&2  
+  printf "%s\n" "${PROG_NAME}: ${message}" >&2
+  
+  return 0   
+}
+
+
+# --------------------------------------
+# STALE LOCKFILE
+# --------------------------------------
+
+function lockfile() {
+  local arg_command="$1"
+  
+  # check if stale lockfile is disabled
+  if [ $STOP_ON_STALE_LOCKFILE == "0" ]; then
+    banana_logger "WARNING: lockfile disabled"
+    return 0
+  fi;
+
+  # on rollback flockfile is already set by previous preexec
+  if [ "${IS_ROLLBACK_PREEXEC}" == "true" ]; then
+    return 0
+  fi;
+  
+  local lockfile_flag=""
+  CMD_OUTPUT=""
+    
+  case "$arg_command" in
+      
+    --preexec)
+        lockfile_flag="PREEXEC"
+    ;;
+    --postexec)
+        lockfile_flag="POSTEXEC"
+    ;;
+    --stalelock_create)
+        if ! mkdir -p ${LOCK_DIR} 2>/dev/null; then
+          CMD_OUTPUT="cannot create stale lock directory"
+	  return 1
+        fi;
+
+        if ! eval "exec ${STALE_LOCK_FD}>>${STALE_LOCK_FILE}"; then
+          CMD_OUTPUT="cannot create stale lockfile"
+          return 1
+        fi;
+
+        # remove stale lockfile on EXIT
+        trap "RETURNCODE=\$?; lockfile --stalelock_delete; exit \$RETURNCODE" EXIT
+
+        if ! flock --exclusive --nonblock ${STALE_LOCK_FD}  ; then
+          CMD_OUTPUT="another bupbanana instance is running";
+          return 1
+        fi;
+
+        return 0
+    ;;
+    --stalelock_delete)
+        CMD_MESSAGE="delete stale lockfile"  
+        
+        # delete lockfile
+        if [ "${IS_DELETE_STALE_LOCK_FILE}" == "true" ]; then
+          rm -f ${STALE_LOCK_FILE} \
+             || { CMD_OUTPUT="cannot stale lockfile";
+                  return 1;
+                }
+        fi;
+        
+        return 0
+    ;;
+    --pidfile_isclean)
+        if [ -s ${PID_FILE} ] ; then
+          CMD_OUTPUT="previous bupbanana finished unclean. you need to "
+          CMD_OUTPUT+="remove the stale lock '${PID_FILE}' "
+          CMD_OUTPUT+="manually to continue"
+          return 1
+        fi
+
+        return 0
+    ;;
+    --pidfile_exists)
+        if [ ! -w ${PID_FILE} ] ; then
+          CMD_OUTPUT="preexec must run before postexec"
+          return 1
+        fi;
+        return 0
+    ;;
+    --pidfile_create)
+        echo ${PID} >| ${PID_FILE} \
+          || { CMD_OUTPUT="cannot creat pidfile";
+               return 1;
+             }
+        return 0
+    ;;
+    --pidfile_cleanup)
+        CMD_MESSAGE="cleanup pidfile"  
+        >| ${PID_FILE} \
+          || { CMD_OUTPUT="cannot write to pidfile";
+               return 1;
+             }
+        return 0
+    ;;
+    --pidfile_delete)
+        CMD_MESSAGE="remove pidfile"  
+        flock --unlock ${STALE_LOCK_FD} \
+           || { CMD_OUTPUT="cannot unlock pidfile";
+                return 1;
+              }
+        rm ${PID_FILE} \
+           || { CMD_OUTPUT="cannot delete pidfile";
+                return 1;
+              }
+        
+        return 0
+    ;;
+    *)
+        error_and_exit "lockfile function wrong command: ${arg_command}"
+        return 1
+    ;;
+  
+  esac  
+
+  # set stale lock to avoid parallel execution
+  lockfile --stalelock_create || return 1
+
+  # flag for trap to delete lockfile on exit
+  IS_DELETE_STALE_LOCK_FILE="true"
+    
+  # some checks before creating pidfile
+  if [ $lockfile_flag == "PREEXEC" ]; then
+    lockfile_preexec_check || return 1
+  elif [ $lockfile_flag == "POSTEXEC" ]; then 
+    lockfile_postexec_check || return 1
+  fi;
+  
+  # create the pidfile
+  lockfile --pidfile_create
+
+     
+  return 0
+}
+
+
+# preexec checks
+function lockfile_preexec_check() {
+  # previous preexec run finished badly, pidfile contains PID
+  if ! lockfile --pidfile_isclean; then
+    return 1
+  fi;
+                    
+  # previous preexec run finished successfully, empty pidfile 
+  if lockfile --pidfile_exists && lockfile --pidfile_isclean; then
+    CMD_OUTPUT="preexec finished successfully. run postexec to complete the run set"
+    return 1
+  fi;
+
+  return 0
+}
+
+
+# postexec checks
+function lockfile_postexec_check() {
+  # no emtpy pidfile left over from preexec
+  if ! lockfile --pidfile_exists; then
+    CMD_OUTPUT="run preexec first"
+    return 1
+  fi;
+
+  # on postexec run we ignore a previous states
+  # to be able to rollback a badly finished preexec
+  if ! lockfile --pidfile_isclean; then
+    banana_logger "WARNING: previous run finished unclean"
+  fi;
+}
+
+
+# --------------------------------------
+# RUN COMMAND
+# --------------------------------------
+
+# run command
+function run_cmd() {
+  IFS=''
+  local cmd="${@}"
+
+  CMD_MESSAGE_STATUS=""
+  CMD_STATUS=0;
+  CMD_MESSAGE=${CMD_MESSAGE:-}
+        
+  if [ -n "$CMD_MESSAGE" ]; then
+    banana_logger "${CMD_MESSAGE}"
+  fi;
+
+  # disable errexit
+  set +o errexit   
+
+  CMD_OUTPUT=$( eval "${cmd}" 2>&1 | \
+    { while IFS='' read -r line;
+        do
+          printf "%s\n" "${line}"
+          if [ "$CMD_DISPLAY" == "1" ]; then
+            banana_logger " \_ $line";
+          fi;
+      done ; 
+    }; 
+  );   
+  # no commands inbetween here
+  CMD_STATUS=$?;
+
+  # enable errexit again
+  set -o errexit
+        
+  if [ "${CMD_STATUS}" = "0" ]; then
+    CMD_MESSAGE_STATUS="OK"
+  else
+    CMD_MESSAGE_STATUS="FAILED"
+    # in case of an error overwrite global CMD_DISPLAY setting
+    CMD_DISPLAY="1"
+  fi
+
+  if [ -n "$CMD_MESSAGE" ] && [ "${CMD_DISPLAY}" == "1" ]; then
+    banana_logger " \_ (${CMD_MESSAGE_STATUS})"
+  fi;
+
+  unset CMD_MESSAGE
+
+  return ${CMD_STATUS}
+}
+
+
+
+# --------------------------------------
+# KVM DOMAIN SNAPSHOTS
+# --------------------------------------
+
+# manage KVM domain snapshots 
+#   parameters: create_as, delete, list
+function domain_snapshot() {
+  local arg_command="${1:-}"
+  local arg_domain_list="${2-}"
+
+  if [ -n "${arg_domain_list}" ]; then
+    IFS=", "
+    for domain in ${arg_domain_list}
+    do
+
+      # check non existing domains
+      if ! domain_exists "${domain}"; then
+        banana_logger "WARNING: domain '${domain}' does not exist. No need to ${arg_command:2} domain snapshot";
+        # next domain
+        continue
+      fi;
+
+      # check offline domains
+      if ! domain_is_running "${domain}"; then
+        banana_logger "INFO: domain '${domain}' offline. No need to ${arg_command:2} domain snapshot";
+        # next domain
+        continue
+      fi;
+
+      case "$arg_command" in
+     
+        --create_as)
+            # create domain snapshot
+            domain_snapshot_create_as "${domain}" || return 1
+      
+            # show snapshot list of a domain
+            domain_snapshot --list "${domain}" || return 1
+
+            # set time via qemu-agent-command and ignore failure
+            domain_settime "${domain}" || true
+        ;;
+        --delete)
+            # DELETE a domain snapshot
+            domain_snapshot_delete "${domain}" || return 1
+            sleep 1
+            ;;
+        --list)
+            # LIST domain snapshot
+            domain_snapshot_list "${domain}" || return 1
+        ;;
+        *)
+            error_and_error "wrong domain_snapshot command"
+        ;;
+      esac
+              
+    done;
+  
+    # set IFS to default
+    IFS=$' \t\n'
+
+  fi;
+
+  return 0
+  
+}
+
+
+# create KVM domain snapshot for the specified domain
+function domain_snapshot_create_as() {
+  local domain="${1}";
+
+  # create domain snapshot
+  CMD_MESSAGE="create domain snapshot for '${domain}'"
+  run_cmd "${_VIRSH} snapshot-create-as ${domain} ${LV_SNAP_NAME_PREFIX} | sed '/^$/d'" \
+    || return 1
+  
+  sleep 1
+
+  return 0
+}
+
+
+# delete KVM domain snapshots for the specified domain
+function domain_snapshot_delete() {
+  local domain="${1}";
+
+  # delete domain snapshot
+  CMD_MESSAGE="delete domain snapshot for '${domain}'"
+  run_cmd "${_VIRSH} snapshot-delete ${domain} ${LV_SNAP_NAME_PREFIX} | sed '/^$/d'" \
+    || return 1
+  
+  return 0
+}
+
+
+# show snapshot list of a domain
+function domain_snapshot_list() {
+  local domain="${1}";
+  
+  CMD_MESSAGE="check snapshot-list for domain '${domain}'"
+  run_cmd "${_VIRSH} snapshot-list --name ${domain} | grep "^${LV_SNAP_NAME_PREFIX}$"" \
+    || return 1
+    
+  return 0
+}
+
+
+# KVM domain exists
+function domain_exists() {
+  local domain="${1}";
+
+  # CMD_MESSAGE="domain '${domain}' exists"
+  run_cmd "${_VIRSH} list --all --name | grep "^${domain}$" > /dev/null" \
+    || return 1
+
+  return 0
+}
+
+
+# is KVM domain running 
+function domain_is_running() {
+  local domain="${1}";
+
+  # CMD_MESSAGE="domain '${domain}' is running"
+  run_cmd "${_VIRSH} list --name --state-running | grep "^${domain}$" > /dev/null" \
+    || return 1
+
+  return 0
+}
+
+
+# try to set time via qemu-agent-command and ignore failure
+function domain_settime() {
+  local $domain="${1}";
+  
+  CMD_MESSAGE="guest-set-time for domain '${domain}'"
+  run_cmd "${_VIRSH} qemu-agent-command ${domain} '{"execute":"guest-set-time"}' > /dev/null 2>&1" \
+    || 1>&2;
+  
+  return 0
+}
+
+
+# --------------------------------------
+# MOUNT HELPERS
+# --------------------------------------
+
+# mount bind partition
+function mount_bind_partition() {
+  local old_dir=$1
+  local new_dir="${BACKUP_DIR}${old_dir}"
+
+  # check if partition is already mounted
+  is_mounted "${new_dir}" || return 1
+
+  # create mount point
+  if [[ ! -d "${new_dir}" ]]; then
+    mkdir -p "${new_dir}" || return 1
+  fi;
+
+  CMD_MESSAGE="mount bind '${old_dir}' to '${new_dir}'";
+  run_cmd "mount --bind ${old_dir} ${new_dir} > /dev/null" \
+    || return 1
+
+  return 0
+}
+
+
+# umount partition
+function umount_partition() {
+  local dir=$1
+
+  CMD_MESSAGE="umount '${dir}'"
+  run_cmd "umount "${dir}" > /dev/null" \
+    || return 1
+}
+
+
+# check if a partition is already mounted
+function is_mounted() {
+  local dir=$1
+
+  CMD_MESSAGE="check previous mount '${dir}'"
+  run_cmd "! mount | grep "${dir}" > /dev/null" \
+    || return 1
+
+  return 0
+}
+
+
+# --------------------------------------
+# LVM SNAPSHOTS
+# --------------------------------------
+
+# manage LVM snapshots
+#   parameters: create, delete, mount, umount, exists
+function lvm_snapshot() {
+
+  local arg_command="${1:-}"
+  local arg_lv_name_list="${2:-}"
+
+  if [ -n "${arg_lv_name_list}" ]; then
+
+    # create or delete a lvm snapshot from given list
+    IFS=", "
+    for lv_name in ${arg_lv_name_list}
+    do
+
+      # get and globally set attributes of a LV
+      get_lvm_attributes "${lv_name}" || return 1
+
+      # set LV snapshot name
+      LV_SNAP_NAME="${LV_SNAP_NAME_PREFIX}_${LV_NAME}"
+
+      # set LV snapshot path
+      LV_SNAP_PATH="/dev/${VG_NAME}/${LV_SNAP_NAME}"
+
+      case "$arg_command" in
+        --create)
+            # check if lvm snapshot exists
+            lvm_snapshot --exists "${lv_name}" || return 1
+            # CREATE LV snapshot    
+            lvm_snapshot_create || return 1
+        ;;
+        --delete)
+            # DELETE LV snapshot
+            lvm_snapshot_delete || return 1
+        ;;
+        --dump)
+            # DUMP LV snapshot
+            lvm_snapshot_dump || return 1
+        ;;
+        --mount)
+            # MOUNT a LV snapshot
+            lvm_snapshot_mount || return 1
+        ;;
+        --umount)
+            # UMOUNT a LV snapshot
+            local lv_backup_dir="${BACKUP_DIR}/${VG_NAME}/$LV_SNAP_NAME"
+            umount_partition "${lv_backup_dir}" || return 1
+        ;;
+        --exists)
+            # EXISTS LV snapshot
+            lvm_snapshot_exists "${LV_SNAP_PATH}" || return 1
+        ;;
+        *)
+            error_and_exit "wrong lvm_snapshot command"
+        ;;
+      esac
+      
+      # lets sync and wait a second
+      sync && sleep 1
+        
+    done;
+
+    # set IFS to default
+    IFS=$' \t\n'
+
+  fi;
+
+  return 0
+
+}
+
+
+# create a lvm snapshot
+function lvm_snapshot_create() {
+  # create lvm snapshot
+  CMD_MESSAGE="create LVM snapshot '${LV_SNAP_NAME}' of LV '${LV_PATH}'"
+  run_cmd "${_LV_CREATE} -l90%FREE -s -n ${LV_SNAP_NAME} ${LV_PATH} > /dev/null" \
+    || return 1
+
+  return 0
+}
+
+
+# delete a lvm snapshot
+function lvm_snapshot_delete() {
+  CMD_MESSAGE="delete LVM snapshot '${LV_SNAP_NAME}' of LV '${LV_PATH}'"
+  run_cmd "${_LV_REMOVE} -f ${LV_SNAP_PATH} > /dev/null" \
+    || return 1
+  
+  return 0
+}
+
+
+# dump a lvm snapshot
+function lvm_snapshot_dump() {
+
+  local lv_image_dir="${IMAGE_DUMP_DIR}/${VG_NAME}/${LV_NAME}"
+  local lv_image_name="${lv_image_dir}/${LV_SNAP_NAME}.raw"
+    
+  # create image dir
+  if [[ ! -d "${lv_image_dir}" ]]; then
+    mkdir -p "${lv_image_dir}" || return 1
+  fi;
+
+  CMD_MESSAGE="delete previous image dump"
+  run_cmd "rm -f ${lv_image_name}" \
+    return 1
+  
+#  CMD_MESSAGE="create image dump of LV '${LV_PATH}' to '${lv_image_name}'"
+#  run_cmd "ionice -c 3 nice -n 19 ${_DDRESCUE} --quiet --sparse ${LV_SNAP_PATH} ${lv_image_name}" \
+#    || return 1
+   run_cmd "echo testdump > ${lv_image_name}"
+
+  # actual file size, not allocated size
+  local diskusage="$(du -hs ${lv_image_name} | cut -f1)"
+  banana_logger "image dump size: ${diskusage}"
+
+  return 0
+}
+
+
+# mount a lvm snapshot
+function lvm_snapshot_mount() {
+
+  # set backup dir           
+  local lv_backup_dir="${BACKUP_DIR}/${VG_NAME}/$LV_SNAP_NAME"
+
+  # check if lvm snapshot is already mounted
+  is_mounted "${lv_backup_dir}" || return 1
+
+  # create mount point if not exists
+  if [[ ! -d "${lv_backup_dir}" ]]; then
+    mkdir -p "${lv_backup_dir}" || return 1
+  fi;
+
+  # mount lvm snapshot read only
+  CMD_MESSAGE="mount LVM snapshot '${LV_SNAP_PATH}' to '${lv_backup_dir}'"
+  run_cmd "mount -o ro ${LV_SNAP_PATH} ${lv_backup_dir}" \
+    || return 1
+ 
+  return 0
+}
+
+
+# check if a LV snapshot already exists
+function lvm_snapshot_exists() {
+ 
+  # check if snapshot exists
+  CMD_MESSAGE="check previous LVM snapshot '${LV_SNAP_PATH}'"
+  run_cmd "! ${_LVS} ${LV_SNAP_PATH} > /dev/null 2>&1" \
+    || return 1
+  
+  return 0
+}        
+
+
+# get and check LV Path and sets global vars LV_PATH, LV_NAME, VG_NAME
+function get_lvm_attributes() {
+  local arg_lv=$1
+
+  local lvs_list=""
+  lvs_list=( $(${_LVS} --separator=";" --nameprefixes --noheadings \
+               --options lv_path,lv_name,vg_name | grep "'${arg_lv}'") ) \
+    || return 1
+
+  # check for same lv_name in different vg_name
+  if [ ${#lvs_list[@]} -gt 1 ]; then
+    return 1
+  fi;
+
+  # declare LV_PATH, LVM2_LV_NAME, LVM2_VG_NAME  
+  eval ${lvs_list[0]}
+  
+  LV_PATH="${LVM2_LV_PATH}"     
+  VG_NAME="${LVM2_VG_NAME}"
+  LV_NAME="${LVM2_LV_NAME}"
+
+  unset LVM2_LV_PATH LVM2_LV_NAME LVM2_VG_NAME
+  
+  return 0
+}
+
+# --------------------------------------
+# PROFILE
+# --------------------------------------
+
+# simple profile validations
+function banana_profile_check() {
+
+  if [ "${CMD_DISPLAY:-}" != "0" ] \
+     && [ "${CMD_DISPLAY:-}" != "1" ]; then
+    CMD_OUTPUT="CMD_DISPLAY wrong value" 
+    return 1
+  fi;
+
+  if [ "${STOP_ON_STALE_LOCKFILE:-}" != "0" ] && \
+     [ "${STOP_ON_STALE_LOCKFILE:-}" != "1" ]; then
+    CMD_OUTPUT="STOP_ON_STALE_LOCKFILE wrong value" 
+    return 1
+  fi;
+
+  if [ "${STOP_ON_STALE_LOCKFILE:-}" == "1" ] \
+     && [ -z "${LOCK_DIR:-}" ]; then
+    CMD_OUTPUT="STOP_ON_STALE_LOCKFILE is set, but LOCK_DIR is missing" 
+    return 1
+  fi;
+
+  if [ -z "${BACKUP_DIR}" ]; then
+    CMD_OUTPUT="BACKUP_DIR is empty"
+    return 1
+  fi;
+
+  if [ -z "${LV_LIST}" ]; then
+    CMD_OUTPUT="LV_LIST is empty"
+    return 1
+  fi;
+  
+  if [ -z "${LV_SNAP_NAME_PREFIX}" ]; then
+    CMD_OUTPUT="LV_SNAP_NAME_PREFIX is empty"
+    return 1
+  fi;
+
+  if [ -z "${_LVS}" ]; then
+    CMD_OUTPUT="lvs is not installed"
+    return 1
+  fi
+  
+  if [ "${arg_command}" == "preexec-with-image" ] \
+     && [ -z "${LV_LIST_IMAGE_DUMP}" ]; then
+    CMD_OUTPUT="LV_LIST_IMAGE_DUMP is empty"
+    return 1
+  fi;
+
+  if [ -n  "${LV_LIST_IMAGE_DUMP}" ] \
+     && [ -z "${_DDRESCUE}" ]; then
+     CMD_OUTPUT="gddrescue is not installed"
+     return 1     
+  fi;
+     
+  if [ -n "${DOMAIN_LIST}" ] && [ -z "${_VIRSH}" ]; then
+    CMD_OUTPUT="DOMAIN_LIST is set, but this seems not to be a KVM host"
+    return 1
+  fi;
+
+  return 0
+}
+
+
+# simple profile syntax parsing on lhs and rhs
+function banana_profile_parse() {
+  local profile=${1:-}
+  local numline=0
+  
+  while IFS='= ' read lhs rhs
+  do
+    numline=$[$numline + 1]
+    if [[ "${lhs}" != *( )#* && \
+          -n "${lhs}" ]]; then
+      rhs_firstchar="${rhs:0:1}"
+      rhs_lastchar="${rhs: -1}"
+      rhs_length=${#rhs}
+      if [[ "$rhs_firstchar" != "\"" ||  "$rhs_lastchar" != "\"" ]] \
+        || [ ${rhs_length} -le 1 ]; then
+        CMD_OUTPUT="wrong syntax in line $numline"
+        return 1
+      fi;
+    fi
+  done < "$profile"
+
+  return 0
+}
+
+
+# load bup options file
+function load_banana_profile() {
+  local profile=${1:-}
+  local banana_profile_check_status=0
+  local banana_profile_parse_status=0
+  
+  # profile syntax check
+  banana_profile_parse "${BANANA_PROFILE}"
+  banana_profile_parse_status="$?"
+  if [ "${banana_profile_parse_status}" == "1" ]; then
+    CMD_OUTPUT="loading profile: $CMD_OUTPUT"
+    return 1
+  fi;
+  
+  # get profile
+  source $profile
+
+  # profile variables and values check
+  banana_profile_check;
+  banana_profile_check_status="$?"
+  if [ "${banana_profile_check_status}" != "0" ]; then
+    CMD_OUTPUT="loading profile: $CMD_OUTPUT"
+    return 1
+  fi;
+
+  # place to set some more globals or overwrite depending on config file
+  #
+  IMAGE_DUMP_DIR="${BACKUP_DIR}/images"
+  STALE_LOCK_FILE="${LOCK_DIR}/lockfile"
+  PID_FILE="${LOCK_DIR}/pidfile"
+       
+  return 0
+}

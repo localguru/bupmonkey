@@ -1,0 +1,329 @@
+#!/bin/bash
+
+# author: Marcus Schopen (marcus.schopen@uni-bielefeld.de)
+# version: 0.1.1-5 (06.06.2016)
+
+
+# turn on bash traces via command line
+# DEBUG=1 bupbanana -c CONFIGFILE
+if [ ${DEBUG:=0} == "1" ]; then
+  export PS4='+ $LINENO: '
+  set -x
+fi;
+    
+# setting locale to POSIX C
+export LC_ALL=C
+
+set -o errexit
+set -o pipefail
+set -o nounset
+set -o noclobber
+
+# unalias
+\unalias -a
+
+# no file an directory permissions for others
+umask o=
+
+# set a secure path 
+PATH='/usr/local/bin:/bin:/usr/bin:/sbin'
+export PATH 
+
+# set a secure IFS
+IFS=$' \t\n'
+
+# suppress leaked on lvs invocation warnings on 
+# open stale lock file handle, see bug #591823
+export LVM_SUPPRESS_FD_WARNINGS=1 
+
+
+# --------------------------------------
+# DEFAULTS
+# --------------------------------------
+
+# defaults and functions
+PID=$$
+PROG_NAME=$(basename "$0")
+BANANA_PROFILE="/etc/bup/bupbanana.conf"
+CMD_DISPLAY="1" # control cmd_run output
+BACKUP_DIR="/vol/backup"
+DOMAIN_LIST=""
+LV_SNAP_NAME_PREFIX="backsnap"
+LV_LIST=""
+LV_LIST_IMAGE_DUMP=""
+LOCK_DIR="/tmp/.bupbanana"
+STALE_LOCK_FD=73
+STOP_ON_STALE_LOCKFILE="1"
+ROLLBACK_PREEXEC="1"
+IS_ROLLBACK_PREEXEC="false"
+IS_DELETE_STALE_LOCK_FILE="false"
+        
+readonly _VIRSH=$(which virsh)
+readonly _DDRESCUE=$(which ddrescue)
+readonly _LVS=$(which lvs)
+readonly _LV_CREATE=$(which lvcreate)
+readonly _LV_REMOVE=$(which lvremove)
+
+# --------------------------------------
+# BANANA LIBRARY
+# --------------------------------------
+
+source "$(dirname "$0")/libbupbanana" \
+  || { echo "ERROR: cannot load bubbanana lib file";
+       exit 1; 
+     }
+
+
+# --------------------------------------
+# PREEXEC COMMANDS
+# --------------------------------------
+
+# prexec commands
+function backup_preexec() {
+  local arg=${1:-}
+
+  # lockfile
+  lockfile --preexec \
+    || error_and_exit "${CMD_OUTPUT}"
+        
+  # create domain snapshots
+  if [ -n "${DOMAIN_LIST}" ]; then
+    domain_snapshot --create_as "${DOMAIN_LIST}" || return 1
+  fi;
+  
+  # mount bind of /boot partiton
+  mount_bind_partition "/boot"  || return 1
+  
+  # create LV snapshots
+  lvm_snapshot --create "${LV_LIST}" || return 1
+
+  # create ddrescue dump before mounting
+  if [[ "$arg" == "with-image" ]]; then
+    lvm_snapshot --dump "${LV_LIST_IMAGE_DUMP}" || return 1
+  fi;
+
+  # mount LV snapshots
+  lvm_snapshot --mount "${LV_LIST}" || return 1
+  
+  # delete domain snapshots
+  if [ -n "${DOMAIN_LIST}" ]; then
+    domain_snapshot --delete "${DOMAIN_LIST}" || return 1
+  fi;
+
+  # cleanup pidfile and keep it to mark a successfull preexec run
+  lockfile --pidfile_cleanup || return 1
+                
+  return 0
+}
+
+
+# --------------------------------------
+# ROLLBACK COMMANDS
+# --------------------------------------
+
+# rollback preexec in case of failure
+function backup_preexec_rollback() {
+  IS_ROLLBACK_PREEXEC="true"
+
+  banana_logger "CRITICAL: preexec some errors occurred"
+  banana_logger "INFO: rollback preexec"
+
+  # try to delete left domain snapshots from unclean preexec
+  if [ -n "${DOMAIN_LIST}" ]; then
+    banana_logger "INFO: try to delete left domain snapshots from unclean preexec"
+    domain_snapshot --delete "${DOMAIN_LIST}" || exit_status=$?
+  fi;
+
+  banana_logger "INFO: run postexec"
+  backup_postexec || return 1
+ 
+  return 0
+}
+
+
+# --------------------------------------
+# POSTEXEC COMMANDS
+# --------------------------------------
+
+# postexec commands
+function backup_postexec() {
+  local exit_status=0
+  local pidfile_isclean=true
+
+  # check if preexec finished clean
+  if ! lockfile --pidfile_isclean; then
+    pidfile_isclean=false
+  fi;
+
+  # lockfile
+  lockfile --postexec \
+    || error_and_exit "${CMD_OUTPUT}"
+
+  # umount lvm snapshot of / partition
+  lvm_snapshot --umount "${LV_LIST}" || exit_status=$?
+  
+  # delete lvm snapshots
+  lvm_snapshot --delete "${LV_LIST}" || exit_status=$?
+  
+  # umount bind of /boot
+  umount_partition "${BACKUP_DIR}/boot" || exit_status=$?
+
+  # delete pidfile on non erros to mark a completely successful run set
+  if [ "${exit_status}" == "0" ]; then 
+    lockfile --pidfile_delete \
+      || error_and_exit "cannot cleanup pidfile"
+  else
+    banana_logger "ERROR: postexec some errors occurred"; 
+  fi;
+  
+  return ${exit_status}
+}
+
+
+# --------------------------------------
+# MAIN
+# --------------------------------------
+        
+function main() {
+
+  # check if profile exists and is readable
+  [ -r "${BANANA_PROFILE}" ] \
+    || { echo "ERROR: no such config file or not readable" >&2; exit 1; };
+
+  # load profile
+  load_banana_profile "${BANANA_PROFILE}" \
+    || { echo "ERROR: ${CMD_OUTPUT}" >&2; exit 1; };
+
+  # run preexec
+  if [ "${arg_command}" == "preexec" ]; then
+    backup_preexec \
+      || { if [ "${ROLLBACK_PREEXEC}" == "0" ]; then
+	     banana_logger "INFO: rollback disabled";
+             error_and_exit "cannot execute preexec";
+           else
+             backup_preexec_rollback \
+               || banana_logger "ERROR: cannot execute preexec rollback";
+             error_and_exit "cannot execute preexec";
+           fi;
+         }
+
+  # run preexec with image dump
+  elif [ "${arg_command}" == "preexec-with-image" ]; then
+    backup_preexec with-image \
+      || { if [ "${ROLLBACK_PREEXEC}" == "0" ]; then
+	     banana_logger "INFO: rollback disabled";
+             error_and_exit "cannot execute preexec with image";
+           else
+             backup_preexec_rollback \
+               || banana_logger "ERROR: cannot execute preexec rollback";
+             error_and_exit "cannot execute preexec with image";
+           fi;
+         }
+
+  # run postexec
+  elif [ "${arg_command}" == "postexec" ]; then
+      backup_postexec \
+        || false;
+  fi;
+
+}
+
+
+# --------------------------------------
+# COMMAND LINE
+# --------------------------------------
+
+# usage info
+function display_help() {
+  # don't display help without a terminal
+  [ "$TERM" == "dumb" ] && return 0
+    
+  cat << EOF
+Usage: ${0##*/} [-h] [--preexec|--preexec-with-image|--postexec] [CONFIGFILE]
+
+    -h|--help               display this help and exit
+    --preexec               run preexec commands
+    --preexec-with-image    run preexec commands with image dump
+    --postexec              run postexec commans
+
+    CONFIGFILE		    the default is /etc/bup/bupbanana.conf
+            
+for full debug trace use DEBUG=1 ${0##*/}
+EOF
+}
+
+
+# check empty parameters
+if [ "$#" -eq 0 ]; then
+  echo "ERROR: missing arguments"
+  display_help
+  exit 1
+fi
+
+
+CMD_OPTIONS=$(getopt --options h --longoptions \
+    "help,preexec,preexec-with-image,postexec" --name "$0" -- "$@" 2>&1 ) \
+  || { echo "ERROR: wrong option or argument"; 
+       display_help; 
+       exit 1; }
+
+eval set -- "${CMD_OPTIONS}"
+
+
+# check command line parameters
+preexec_flag=false
+postexec_flag=false
+arg_command=""
+
+while [ $# -gt 0 ] ; 
+do
+  case "$1" in
+    -h|--help)
+        display_help;
+        exit 0
+    ;;
+    --preexec)
+        preexec_flag=true
+        arg_command="preexec"
+    ;;
+    --preexec-with-image)
+        preexec_flag=true
+        arg_command="preexec-with-image"
+    ;;
+    --postexec)
+        postexec_flag=true
+        arg_command="postexec"
+    ;;
+    --)  # end of all options
+        shift
+        break
+    ;;
+    *)
+        echo "internal error"
+        exit 1
+    ;;
+
+  esac
+  shift
+
+done  
+
+# post checking given arguments and options
+if [ $preexec_flag == true ] && [ $postexec_flag == true ]; then
+  echo "ERROR: excluding arguments"
+  display_help
+  exit 1
+elif [ $preexec_flag == false ] && [ $postexec_flag == false ]; then
+  echo "ERROR: missing arguments"
+  display_help
+  exit 1
+fi
+
+# overwrite default config file location
+if [ -n "${1:-}" ]; then
+   BANANA_PROFILE="${1}"
+fi
+
+main;
+
+exit $?

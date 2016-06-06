@@ -1,0 +1,723 @@
+#!/bin/bash
+
+# author: Marcus Schopen (marcus.schopen@uni-bielefeld.de)
+# version: 0.1.1-5 (06.06.2016)
+
+
+# turn on bash traces via command line
+# DEBUG=1 bupmonkey -c CONFIGFILE
+if [ ${DEBUG:=0} == "1" ]; then
+  export PS4='+ $LINENO: '
+  set -x
+fi;
+
+
+# setting locale to POSIX C
+export LC_ALL=C
+
+set -o errexit
+set -o pipefail
+set -o nounset
+set -o noclobber
+
+shopt -s extglob
+
+# unalias
+\unalias -a
+
+# no file an directory permissions for others
+umask o=
+
+# set a secure path
+PATH='/usr/local/bin:/bin:/usr/bin'
+export PATH
+
+# set a secure IFS
+IFS=$' \t\n'
+
+# clear the command path hash
+hash -r
+
+
+# defaults
+readonly HOST_NAME=$(hostname)
+readonly PROG_NAME=$(basename "$0")
+readonly _BUP="$(which bup)"
+readonly _GIT="$(which git)"
+readonly PID=$$
+STOP_ON_STALE_LOCKFILE="1"
+STALE_LOCK_DIR="/tmp/.bupmonkey"
+BUP_REMOTE="0"
+BUP_REMOTE_HOST=""
+BUP_SCRIPT_PREEXEC=""           
+BUP_SCRIPT_POSTEXEC=""
+BUP_INDEX_OPTIONS=""
+BUP_SAVE_OPTIONS=""
+BUP_FSCK="0"
+BUP_FSCK_OPTIONS=""
+CMD_DISPLAY="1"
+BUP_INDEX_DISPLAY="1"
+CMD_OUTPUT=""
+BUP_LOG_FILE=""
+BUP_LOG_FILE_GLOBAL="/var/log/bup/bupmonkey.log"
+BUP_LOG_FILE_PREFIX="1"
+DISABLE_LOG_PREFIX_BUP_SCRIPT=""
+
+# --------------------------------------
+# LOGGING
+# --------------------------------------
+
+# error and exit
+function error_and_exit() {
+  local message=${1:-}
+  
+  BUP_LOG_FILE_PREFIX="1"
+  bup_logger "CRITICAL: bupmonkey finished with errors: $message. Aborting!"
+
+  # restore stdout and stderr and close file descriptors
+  exec 1>&6 2>&7 6>&- 7>&-
+
+  # print errors to console if terminal exists
+  if [ $TERM != "dumb" ]; then
+    printf "%s\n" "ERROR: $message. Aborting!" 1>&2
+  fi;
+
+  exit 1;
+}
+      
+
+# general logging
+function bup_logger() {
+  local message=${1:-}
+
+  if [ "${message}" != "" ]; then
+
+    # changed file descriptors for stdout and stderr are lost when 
+    # bash starts a subshells and call bup_logger from there e.g. in 
+    # a PIPED "while-read" loop like in run_cmd. To catch this output 
+    # too we need to write directly to logile
+    {  
+      if [ ${BUP_LOG_FILE_PREFIX} == "1" ]; then
+        printf "%(%a %d %b %Y %T)T %s" -1
+        printf "%s" "${PROG_NAME}: "
+      else
+        # if output comes with full time stamp like form bupbanana
+        # insert a "|" after time stamp to mark it as sub run_cmd
+        message="${message:0:35}  | ${message:36}"
+      fi;
+    
+      printf "%s\n" "${message}"
+    } >> ${BUP_LOG_FILE} \
+      || error_and_exit "cannot write to logfile"
+  fi;
+  
+  return 0
+}
+
+
+# create logfile and redirect stdout and stderr to logfile
+function create_bup_log_file() {
+  # create a new logfile if not exists
+  if [ ! -e "${BUP_LOG_FILE}" ]; then
+    if ! touch "${BUP_LOG_FILE}" 2>/dev/null; then
+      CMD_OUTPUT="cannot create logfile"
+      return 1
+    fi
+    bup_logger "INFO: create new logfile"
+  # check if logfile is writeable
+  elif [ ! -w "${BUP_LOG_FILE}" ]; then
+    CMD_OUTPUT="logfile is not writable";
+    return 1
+  fi;
+
+  # link file descriptor #6 with stdout and
+  # file descriptor #7 with stderr.
+  exec 6>&1 7>&2
+
+  # stdout and error replaced with logfile
+  exec &>> ${BUP_LOG_FILE}
+  
+  return 0                                           
+}
+
+
+# --------------------------------------
+# RUN COMMAND
+# --------------------------------------
+
+# run command
+function run_cmd() {
+  local cmd="$@"
+  CMD_MESSAGE_STATUS=""
+  CMD_STATUS=0;
+  CMD_MESSAGE=${CMD_MESSAGE:-}
+
+  local save_bup_log_file_prefix="${BUP_LOG_FILE_PREFIX}" 
+
+  BUP_LOG_FILE_PREFIX="1"
+  if [ -n "$CMD_MESSAGE" ]; then
+    bup_logger "${CMD_MESSAGE}"
+  fi;
+  BUP_LOG_FILE_PREFIX=${save_bup_log_file_prefix}
+
+  # disable errexit
+  set +o errexit  
+
+  # We use a PIPED "while-read" loop to write output without delay to 
+  # bup_logger to get real time stamps. This creates a bash subshell 
+  # where globally changed stdout and stderr redirections to logfile 
+  # get lost. That's why we explicitly need to redirect stdout in 
+  # bup_logger to logfile.
+ 
+  CMD_OUTPUT=$( eval "${cmd}" 2>&1 | \
+    { while IFS='' read -r line ;
+        do
+          printf "%s\n" "${line}"
+          if [ "$CMD_DISPLAY" == "1" ]; then
+            if [ "${BUP_LOG_FILE_PREFIX}" == "1" ]; then
+              bup_logger " | $line";
+            else 
+              bup_logger "$line";
+            fi;
+          fi;
+      done ;
+    }; 
+  );
+  # no commands inbetween here
+  CMD_STATUS=$?;
+
+  # enable errexit again
+  set -o errexit
+        
+  if [ "${CMD_STATUS}" = "0" ]; then
+    CMD_MESSAGE_STATUS="OK"
+  else
+    CMD_MESSAGE_STATUS="FAILED"
+    # in case of an error overwrite global CMD_DISPLAY setting
+    CMD_DISPLAY="1"   
+  fi
+
+  BUP_LOG_FILE_PREFIX="1"
+  if [ -n "$CMD_MESSAGE" ] && [ "$CMD_DISPLAY" == "1" ]; then
+    bup_logger " \_ (${CMD_MESSAGE_STATUS})"
+  fi;
+
+
+  unset CMD_MESSAGE
+
+  return ${CMD_STATUS}
+}
+
+
+# --------------------------------------
+# RUN SCRIPT
+# --------------------------------------
+
+# run sets of preexec and postexec scripts before and after running bup
+function run_script() {
+
+  local bup_script_set_name="$1"
+  
+  # check allowed parameter
+  if [ "${bup_script_set_name}" != "BUP_SCRIPT_PREEXEC" ] \
+       && [ "${bup_script_set_name}" != "BUP_SCRIPT_POSTEXEC" ]; then
+    bup_logger "wrong parameter: '${script_set_name}'"
+    return 1
+  fi
+
+  # list of all BUP_SCRIPT_PREEXEC or BUP_SCRIPT_POSTEXEC variables
+  eval local bup_script_set_list=\${!$bup_script_set_name*}
+
+  # sort list and assign it to an array
+  local bup_script_set=($( echo ${bup_script_set_list} | xargs -n1 | \
+                           sort --field-separator="_" --key=4 \
+                           --sort=human-numeric | xargs ))
+
+  # some counter variables
+  local counter="0"
+  local is_script_executed=false
+
+  # run script commands, return on first failure
+  for script in "${bup_script_set[@]}" 
+  do
+
+    # check if log prefix is disabled
+    if [ -n "${script}" ]; then
+
+      # check if log prefix is disabled for current script
+      # and set disabled_log_prefix indirectly
+      for check_log_prefix in ${DISABLE_LOG_PREFIX_BUP_SCRIPT}
+      do
+        if [ "${script}" == "${check_log_prefix}" ]; then
+          BUP_LOG_FILE_PREFIX="0"
+          break
+        fi;
+      done;
+
+      CMD_MESSAGE="run $bup_script_set_name#${counter}: '${!script}'"
+
+      run_cmd "${!script}" \
+        || return 1
+
+      BUP_LOG_FILE_PREFIX="1"
+      is_script_executed=true
+      
+    fi;
+
+    counter=$[$counter +1]
+
+  done
+
+  # exit if first is empty
+  if [ ${is_script_executed} == "false" ]; then
+    echo "INFO: non ${bup_script_set_name} scripts defined"
+  fi;
+
+  return 0
+}
+
+
+# execute preexec scripts
+function bup_preexec() {
+  run_script "BUP_SCRIPT_PREEXEC" \
+    || return 1
+  
+  return 0
+}
+
+
+# execute postexec scripts
+function bup_postexec() {
+  local exit_status=0
+  
+  run_script "BUP_SCRIPT_POSTEXEC" \
+    || exit_status=1
+
+  return $exit_status
+}
+
+
+# rollback preexec comands
+function bup_preexec_rollback() {
+
+  if [ "${BUP_ROLLBACK}" == "1" ]; then
+    bup_logger "CRITICAL: due to some errors we try to rollback preexec"
+    bup_postexec \
+      || return 1
+  else
+    bup_logger "INFO: rollback disabled"
+  fi;
+
+  return 0
+}
+
+
+# --------------------------------------
+# STALE LOCKFILE
+# --------------------------------------
+
+function create_stale_lockfile() {
+  if ! mkdir -p ${REPO_STALE_LOCK_DIR} 2>/dev/null; then
+    CMD_OUTPUT="cannot create stale lock directory"
+    return 1
+  fi;
+  
+  if ! eval "exec ${REPO_STALE_LOCK_FD}>>${REPO_STALE_LOCK_FILE}"; then
+    CMD_OUTPUT="cannot create stale lockfile"
+    return 1
+  fi;
+
+  if ! flock --exclusive --nonblock ${REPO_STALE_LOCK_FD}  ; then
+     CMD_OUTPUT="another bupmonkey instance is running on this bup repository";
+     return 1
+  fi;
+
+  if [ -s ${REPO_STALE_LOCK_FILE} ] ; then 
+    CMD_OUTPUT="previous bupmonkey finished unclean. you need to remove the "
+    CMD_OUTPUT+="stale lock '${REPO_STALE_LOCK_FILE}' manually to continue"
+    return 1
+  else
+    echo ${PID} >| ${REPO_STALE_LOCK_FILE}
+  fi;
+
+  return 0
+}
+
+
+function cleanup_stale_lockfile() {
+  CMD_MESSAGE="cleanup stale lockfile"
+  run_cmd ">| ${REPO_STALE_LOCK_FILE}" \
+    || return 1
+
+  return 0
+}
+
+
+# --------------------------------------
+# BUP COMMANDS
+# --------------------------------------
+
+# update the bup filesystem index
+function bup_index() {
+  CMD_MESSAGE="update bup index '${BUP_REPO_DIR}'"
+
+  local global_cmd_display="${CMD_DISPLAY}"
+  CMD_DISPLAY=${BUP_INDEX_DISPLAY}
+   
+  if [ ${BUP_REMOTE} = "1" ]; then
+    run_cmd "${_BUP} --bup-dir=${BUP_REPO_DIR} on ${BUP_REMOTE_HOST} \
+            index ${BUP_INDEX_OPTIONS} ${BUP_FILE_NAMES}" \
+      || return 1
+  else
+    run_cmd "${_BUP} --bup-dir=${BUP_REPO_DIR} \
+            index ${BUP_INDEX_OPTIONS} ${BUP_FILE_NAMES}" \
+      || return 1
+  fi;
+
+  CMD_DISPLAY=${global_cmd_display}
+  
+  return 0
+}
+
+
+# create a new bup backup set
+function bup_save() {
+  CMD_MESSAGE="create new bup backupset on '${BUP_REPO_DIR}'"
+  if [ ${BUP_REMOTE} = "1" ]; then
+    run_cmd "${_BUP} --bup-dir=${BUP_REPO_DIR} on ${BUP_REMOTE_HOST} \
+            save -n ${BUP_REPO_NAME} ${BUP_SAVE_OPTIONS} ${BUP_FILE_NAMES}" \
+      || return 1
+  else
+    run_cmd "${_BUP} --bup-dir=${BUP_REPO_DIR} \
+            save -n ${BUP_REPO_NAME} ${BUP_SAVE_OPTIONS} ${BUP_FILE_NAMES}" \
+      || return 1
+  fi;
+      
+  return 0
+}
+
+
+# some post run checking
+function bup_post_checks() {
+  [[ -n "$BUP_FSCK" ]] && bup_fsck
+
+  CMD_MESSAGE="check git repository"
+  run_cmd eval "GIT_DIR=${BUP_REPO_DIR} ${_GIT} log -1 --pretty=oneline \
+                  ${BUP_REPO_NAME} | sed -E 's/^([^[:space:]]+).*/\1/'"
+                  
+  bup_logger "INFO: last git commit hash: ${CMD_OUTPUT}"  
+  
+  local diskusage=$(du -hs ${BUP_REPO_DIR} | cut -f1)
+  bup_logger "INFO: disk usage: ${diskusage}"
+
+  return 0
+}
+
+
+# verify a bup repository with bup-fsck
+function bup_fsck() {
+  CMD_MESSAGE="bup fsck on '${BUP_REPO_DIR}'"
+  run_cmd "${_BUP} --bup-dir=${BUP_REPO_DIR} fsck ${BUP_FSCK_OPTIONS}" \
+    || return 1
+
+  return 0
+}
+
+
+# check bup repo dir and existing bup index
+function is_bup_init() {
+
+  # check if repo dir contains a bup repo   
+  if ! ${_BUP} --bup-dir=${BUP_REPO_DIR} ls &>/dev/null; then
+    CMD_OUTPUT="'${BUP_REPO_DIR}' is not a bup repository; run 'bup init ${BUP_REPO_DIR}'"
+    return 1
+  fi;
+  
+  if [ ${BUP_REMOTE} == "1" ]; then
+    if ! ${_BUP} on ${BUP_REMOTE_HOST} ls &>/dev/null; then
+      CMD_OUTPUT="missing bup index on remote site; run 'bup on ${BUP_REMOTE_HOST} init'"
+      return 1
+    fi;
+  fi;
+
+  return 0      
+}
+
+# --------------------------------------
+# PROFILE
+# --------------------------------------
+
+# simple profile validations
+function bup_profile_check() {
+
+  # fall back to global bup logfile
+  if [ -z "${BUP_LOG_FILE:-}" ]; then
+    BUP_LOG_FILE="${BUP_LOG_FILE_GLOBAL}"
+  fi;
+
+  if [ "${CMD_DISPLAY:-}" != "0" ] && [ "${CMD_DISPLAY:-}" != "1" ]; then
+    CMD_OUTPUT="CMD_DISPLAY wrong value" 
+    return 1
+  fi;
+
+  if [ "${BUP_INDEX_DISPLAY:-}" != "0" ] && [ "${BUP_INDEX_DISPLAY:-}" != "1" ]; then
+    CMD_OUTPUT="BUP_INDEX_DISPLAY wrong value" 
+    return 1
+  fi;
+
+  if [ "${STOP_ON_STALE_LOCKFILE:-}" != "0" ] && \
+     [ "${STOP_ON_STALE_LOCKFILE:-}" != "1" ]; then
+    CMD_OUTPUT="STOP_ON_STALE_LOCKFILE wrong value" 
+    return 1
+  fi;
+
+  if [ "${STOP_ON_STALE_LOCKFILE:-}" = "1" ] && \
+     [ -z "${STALE_LOCK_DIR:-}" ]; then
+    CMD_OUTPUT="STOP_ON_STALE_LOCKFILE is set, but STALE_LOCK_DIR is missing" 
+    return 1
+  fi;
+
+  if [ -z "${BUP_REPO_DIR:-}" ]; then
+    CMD_OUTPUT="BUP_REPO_DIR not set"
+    return 1
+  elif  [ ! -w "${BUP_REPO_DIR}" ]; then
+    CMD_OUTPUT="BUP_REPO_DIR '${BUP_REPO_DIR}' does not exist or is not writable"
+    return 1
+  fi;
+
+  if [ -z "${BUP_REPO_NAME:-}" ]; then
+    CMD_OUTPUT="BUP_REPO_NAME not set"
+    return 1
+  fi;
+
+  if [ -z "${BUP_FILE_NAMES:-}" ]; then
+    CMD_OUTPUT="BUP_FILE_NAMES not set"
+    return 1
+  fi;
+
+  if [ "${BUP_REMOTE:-}" != "0" ] && \
+     [ "${BUP_REMOTE:-}" != "1" ]; then
+    CMD_OUTPUT="BUP_REMOTE wrong value" 
+    return 1
+  fi;
+  
+  if [ "${BUP_REMOTE:-}" = "1" ] &&  \
+     [ -z "${BUP_REMOTE_HOST:-}" ]; then
+    CMD_OUTPUT="BUP_REMOTE is set, but BUP_REMOTE_HOST is missing"
+    return 1
+  fi;
+
+  if [ "${BUP_FSCK:-}" != "0" ] && \
+     [ "${BUP_FSCK:-}" != "1" ]; then
+    CMD_OUTPUT="BUP_FSCK wrong value"
+    return 1
+  fi;
+
+  return 0
+}
+
+
+# simple profile syntax parsing
+function bup_profile_parse() {
+  local profile=${1:-}
+  local numline=0
+  
+  while IFS='= ' read lhs rhs
+  do
+    numline=$[$numline + 1]
+    if [[ "${lhs}" != *( )#* && \
+          -n "${lhs}" ]]; then
+      rhs_firstchar="${rhs:0:1}"
+      rhs_lastchar="${rhs: -1}"
+      rhs_length=${#rhs}
+      if [[ "$rhs_firstchar" != "\"" ||  "$rhs_lastchar" != "\"" ]] \
+        || [ ${rhs_length} -le 1 ]; then
+        CMD_OUTPUT="wrong syntax in line $numline"
+        return 1
+      fi;
+    fi
+  done < "$profile"
+
+  return 0
+}
+
+
+# load bup options file
+function load_bup_profile() {
+  local profile=${1:-}
+  local bup_profile_check_status=0
+  local bup_profile_parse_status=0
+  
+  # profile syntax check
+  bup_profile_parse "${BUP_PROFILE}"
+  bup_profile_parse_status="$?"
+  if [ "${bup_profile_parse_status}" == "1" ]; then
+    CMD_OUTPUT="loading profile: $CMD_OUTPUT"
+    return 1
+  fi;
+  
+  # get profile
+  source $profile
+
+  # profile variables and values check
+  bup_profile_check;
+  bup_profile_check_status="$?"
+  if [ "${bup_profile_check_status}" != "0" ]; then
+    CMD_OUTPUT="loading profile: $CMD_OUTPUT"
+    return 1
+  fi;
+
+  # set some more globals
+  REPO_STALE_LOCK_DIR="${STALE_LOCK_DIR}/${BUP_REPO_DIR}"
+  readonly REPO_STALE_LOCK_DIR="${REPO_STALE_LOCK_DIR//\/*(\/)/\/}"
+
+  REPO_STALE_LOCK_FILE="${STALE_LOCK_DIR}/${BUP_REPO_DIR}/lockfile"
+  readonly REPO_STALE_LOCK_FILE="${REPO_STALE_LOCK_FILE//\/*(\/)/\/}"
+
+  readonly REPO_STALE_LOCK_FD=73  
+     
+  return 0
+}
+
+
+# --------------------------------------
+# MAIN
+# --------------------------------------
+
+# main
+function main() {
+  local exit_status=0
+
+  # we need at least bash version 4.2 because of printf builtin %(fmt)T
+  # specifier which is a huge speed benefit compared to fork and exec 
+  # date command for time stamps on e.g. massiv bup index output in 
+  # bup_logger. older bash versions might use ts instead.
+  if [ "${BASH_VERSINFO[0]}" -lt "4" ] || \
+     ( [ "${BASH_VERSINFO[0]}" -eq "4" ] && \
+       [ "${BASH_VERSINFO[1]}" -lt "2" ] ) ; then
+    echo "ERROR: your bash version is to old. you need at least version 4.2"
+    exit 1
+  fi;
+            
+  if [ -z ${_BUP} ]; then
+    echo "ERROR: bup is not installed" >&2
+    exit 1
+  fi
+ 
+  # check if profile exists and is readable
+  [ -r "${BUP_PROFILE}" ] \
+    || { echo "ERROR: no such config file or not readable" >&2; exit 1; };
+
+  # loading profile
+  load_bup_profile "${BUP_PROFILE}" \
+    || { echo "ERROR: ${CMD_OUTPUT}" >&2; exit 1; };
+
+  # check if bup repo is initialized and has an 
+  # existing bup index on remote site
+  is_bup_init \
+    || { echo "ERROR: ${CMD_OUTPUT}" >&2; exit 1; };
+
+  # create stale lock to prevent parallel execution on the same repo
+  create_stale_lockfile \
+    || { echo "ERROR: ${CMD_OUTPUT}" >&2; exit 1; };
+
+  # create bup logfile
+  # from this point stdout and stderr are redirected to logfile
+  create_bup_log_file \
+    || { echo "ERROR: ${CMD_OUTPUT}" >&2; exit 1; };
+
+  bup_logger "bupmonkey starting with PID ${PID}. banana time"
+
+  # run preexec commands
+  bup_preexec \
+    || { bup_preexec_rollback || true;
+         error_and_exit "cannot execute preexec script"; };
+
+  # update bup index
+  bup_index \
+    || { bup_preexec_rollback || true;
+         error_and_exit "cannot update bup index"; };
+
+  # create a new bup backup set
+  bup_save \
+    || { bup_preexec_rollback || true;
+         error_and_exit "cannot create a new bup backup set"; };
+               
+  # run postexec commands    
+  bup_postexec \
+    || exit_status=$?
+  
+  # some checks after bup repo work is done
+  bup_post_checks \
+    || exit_status=$?
+ 
+  if [ "${exit_status}" != "0" ]; then
+    error_and_exit "some errors occurred";
+  fi;
+  
+  # clean up stale lockfile
+  cleanup_stale_lockfile \
+    || error_and_exit "cannot cleanup stale lockfile"
+        
+  bup_logger "monkey got banana. bupmonkey finished successfully"
+
+  return 0
+}
+
+
+# --------------------------------------
+# COMMAND LINE
+# --------------------------------------
+
+# usage info
+function display_help() {
+cat << EOF   
+Usage: ${0##*/} [-h] [-c CONFIGFILE]
+
+    -h             display this help and exit
+    -c CONFIGFILE  read configuration from file
+
+for full debug trace use DEBUG=1 ${0##*/}
+EOF
+}
+                            
+
+# check command line arguments
+OPTIND=1
+c_flag=false;
+while getopts ":hc:" opt; do
+  case ${opt} in
+    "h")
+      display_help
+      exit 0   
+      ;;
+    "c")
+      c_flag=true;
+      BUP_PROFILE=${OPTARG}
+      ;;
+    "?")
+      echo "Invalid option: -${OPTARG}" >&2
+      exit 1
+      ;;
+    ":")
+      echo "Option -${OPTARG} requires an argument" >&2
+      exit 1
+      ;;
+    *)
+      echo "Unknown error"
+      exit 1
+      ;;
+  esac
+done
+
+shift $(($OPTIND -1))
+
+# mandatory options
+if [[ "${c_flag}" = false ]] ; then
+  display_help >&2;
+  exit 1;
+fi;
+
+main;
+
+exit $?;
